@@ -1,0 +1,41 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "type": "shell",
+            "label": "Build kintsugi_inference.exe",
+            "command": "g++",
+            "args": [
+                "-O3",
+                "-mavx2",
+                "-mfma",
+                "-fopenmp",
+                "-std=c++17",
+                "-o",
+                "kintsugi_inference.exe",
+                "kintsugi_inference.cpp",
+                "-lws2_32"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": ["$gcc"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "Matches the exact build command used all session (Ctrl+Shift+B)"
+        },
+        {
+            "type": "shell",
+            "label": "Run kintsugi_inference.exe",
+            "command": "${workspaceFolder}\\kintsugi_inference.exe",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "test",
+            "dependsOn": "Build kintsugi_inference.exe",
+            "detail": "Build then run in one step"
+        }
+    ]
+}

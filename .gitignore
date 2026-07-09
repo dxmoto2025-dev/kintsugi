@@ -1,0 +1,18 @@
+# Build output
+*.exe
+*.obj
+*.o
+*.pdb
+build/
+.ninja_log
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor/tool temp files
+*.tmp.*
+
+# Runtime state and diagnostics (regenerated on every run, not source)
+core/shared_bus.dat
+mem_trace_wake_*.csv

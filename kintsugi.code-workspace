@@ -1,0 +1,14 @@
+{
+    "folders": [
+        {
+            "path": "."
+        }
+    ],
+    "settings": {
+        "workbench.editorAssociations": {
+            "*.gguf": "hexEditor.hexedit",
+            "*.bin": "hexEditor.hexedit"
+        },
+        "C_Cpp.default.cppStandard": "c++17"
+    }
+}

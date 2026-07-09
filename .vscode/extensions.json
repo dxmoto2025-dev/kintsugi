@@ -1,0 +1,9 @@
+{
+    "recommendations": [
+        "ms-vscode.cpptools",
+        "ms-vscode.hexeditor",
+        "usernamehw.errorlens",
+        "ms-python.python",
+        "streetsidesoftware.code-spell-checker"
+    ]
+}

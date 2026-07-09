@@ -1,0 +1,21 @@
+{
+    "configurations": [
+        {
+            "name": "MinGW-GCC",
+            "includePath": [
+                "${workspaceFolder}/**"
+            ],
+            "defines": [],
+            "compilerPath": "C:\\Users\\Admin\\Downloads\\Kintsugi_Edge\\build\\quantum-silicon-os\\build\\Production\\mingw64\\bin\\g++.exe",
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "gcc-x64",
+            "compilerArgs": [
+                "-mavx2",
+                "-mfma",
+                "-fopenmp"
+            ]
+        }
+    ],
+    "version": 4
+}
