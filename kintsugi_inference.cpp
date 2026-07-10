@@ -1,5 +1,7 @@
 #include <windows.h>
 #include <psapi.h>
+#include <pdh.h>
+#include <pdhmsg.h>
 #include <iostream>
 #include <random>
 #include <vector>
@@ -7,6 +9,7 @@
 #include <atomic>
 #include <immintrin.h>
 #include <cmath>
+#include <omp.h>
 #include <limits>
 #include <climits>
 #include <cstdint>
@@ -39,11 +42,33 @@ void PrintMemoryUsage(const char* label) {
     mem_status.dwLength = sizeof(mem_status);
     bool sys_ok = GlobalMemoryStatusEx(&mem_status);
 
+    // Delta-tracked, not cumulative -- a lifetime PageFaultCount would bury
+    // "how many faults happened during THIS specific phase" under every
+    // fault since process start. Static accumulator means each call's
+    // printed number is isolated to what happened since the PREVIOUS call,
+    // regardless of which call site it came from -- exactly what's needed
+    // to isolate prefill's 32-layer loop specifically.
+    //
+    // Honest limitation, confirmed via real sources before writing this:
+    // PageFaultCount is BOTH hard (disk-driven) and soft (memory-resident-
+    // elsewhere) faults combined -- Windows does not expose that split
+    // through this struct. A low delta cleanly rules out heavy disk
+    // activity (few faults of any kind = little new memory touched). A
+    // high delta is genuinely ambiguous on its own and would need the PDH
+    // \Memory\Page Reads/sec counter (hard-fault-specific, heavier API) to
+    // resolve further -- not built here, this is the free first signal,
+    // not a final answer.
+    static DWORD last_fault_count = 0;
+
     if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
         double working_set_mb = static_cast<double>(pmc.WorkingSetSize) / (1024.0 * 1024.0);
         double private_mb     = static_cast<double>(pmc.PagefileUsage)  / (1024.0 * 1024.0);
+        DWORD fault_delta      = pmc.PageFaultCount - last_fault_count;
+        last_fault_count       = pmc.PageFaultCount;
+
         std::cout << "    [MEM] " << label << " WorkingSet=" << working_set_mb
-                  << "MB Private=" << private_mb << "MB";
+                  << "MB Private=" << private_mb << "MB Faults(Total=" << pmc.PageFaultCount
+                  << " Delta=+" << fault_delta << ")";
         if (sys_ok) {
             std::cout << " SysMemLoad=" << mem_status.dwMemoryLoad << "%";
         }
@@ -64,6 +89,20 @@ double GetProcessWorkingSetMB() {
         return static_cast<double>(pmc.WorkingSetSize) / (1024.0 * 1024.0);
     }
     return -1.0;
+}
+
+// Query counterpart for PageFaultCount -- same reasoning as
+// GetProcessWorkingSetMB above: PrintMemoryUsage tracks its own delta
+// internally for display, but the decode loop needs the raw current value
+// itself to compute an independent, caller-side delta and decide whether
+// to trigger the residency check. Returns -1 on failure, matching the
+// sentinel convention used throughout this file.
+DWORD GetPageFaultCount() {
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        return pmc.PageFaultCount;
+    }
+    return static_cast<DWORD>(-1);
 }
 
 // Non-invasive residency check: answers "is this specific page currently
@@ -96,6 +135,111 @@ void PrintBufferResidency(const char* label, const uint8_t* buffer, size_t size_
                   << (resident ? "resident" : "EVICTED") << "]";
     }
     std::cout << "\n";
+}
+
+// ==============================================================================
+// KINTSUGI: PDH HARD-FAULT ESCALATION
+// ==============================================================================
+// PageFaultCount (used above) conflates hard (disk-driven) and soft
+// (page-already-in-RAM-elsewhere) faults into one number -- confirmed via
+// real sources before it was ever added, and confirmed AGAIN by the actual
+// data: prefill's fault count matched the theoretical page volume almost
+// exactly, but couldn't tell us whether that volume cost ~1.5s (soft) or
+// ~50s (hard) of the total time. \Memory\Page Reads/sec is the specific
+// PerfMon counter that isolates hard faults only -- this is that escalation.
+//
+// Honest limitation, not hidden: this counter is SYSTEM-WIDE, not scoped to
+// our process. There is no per-process equivalent for hard-fault reads
+// specifically. On a quiet test machine with nothing else doing heavy disk
+// I/O during the bracketed window, this is a reasonable proxy for "what did
+// OUR prefill cause" -- but it is not the same clean isolation the
+// process-specific WorkingSet/PageFaultCount readings give us.
+//
+// Page Reads/sec is a rate counter, but its underlying raw value is a
+// genuine monotonic cumulative count -- PdhGetRawCounterValue reads that
+// directly, so before/after deltas work the exact same way as every other
+// counter in this file, no polling or rate-integration needed.
+HQUERY g_PdhQuery = nullptr;
+HCOUNTER g_PdhHardFaultCounter = nullptr;
+bool g_PdhAvailable = false;
+
+void InitPdhHardFaultQuery() {
+    if (PdhOpenQuery(NULL, 0, &g_PdhQuery) != ERROR_SUCCESS) {
+        std::cout << "[!] WARNING: PdhOpenQuery failed -- hard-fault escalation unavailable, "
+                     "continuing with PageFaultCount only.\n";
+        return;
+    }
+    if (PdhAddCounterA(g_PdhQuery, "\\Memory\\Page Reads/sec", 0, &g_PdhHardFaultCounter) != ERROR_SUCCESS) {
+        std::cout << "[!] WARNING: PdhAddCounter for \\Memory\\Page Reads/sec failed -- hard-fault "
+                     "escalation unavailable, continuing with PageFaultCount only.\n";
+        PdhCloseQuery(g_PdhQuery);
+        g_PdhQuery = nullptr;
+        return;
+    }
+    // Prime the query -- first collect establishes the counter's internal
+    // baseline sample; the raw cumulative value is usable from this point on.
+    PdhCollectQueryData(g_PdhQuery);
+    g_PdhAvailable = true;
+    std::cout << "[✓ PDH] Hard-fault query live (\\Memory\\Page Reads/sec, system-wide).\n";
+}
+
+// Returns the raw cumulative hard-page-read count, or -1 on failure (sentinel:
+// caller should treat as "unknown," matching the pattern used elsewhere in
+// this file rather than silently returning 0 and looking like a real zero delta).
+LONGLONG GetHardFaultRaw() {
+    if (!g_PdhAvailable) return -1;
+    if (PdhCollectQueryData(g_PdhQuery) != ERROR_SUCCESS) return -1;
+
+    PDH_RAW_COUNTER raw;
+    DWORD counter_type;
+    if (PdhGetRawCounterValue(g_PdhHardFaultCounter, &counter_type, &raw) != ERROR_SUCCESS) return -1;
+    if (raw.CStatus != PDH_CSTATUS_VALID_DATA && raw.CStatus != PDH_CSTATUS_NEW_DATA) return -1;
+
+    return raw.FirstValue;
+}
+
+void PrintHardFaultDelta(const char* label, LONGLONG before, LONGLONG after) {
+    if (before < 0 || after < 0) {
+        std::cout << "    [HARDFAULT] " << label << " -- unavailable this run.\n";
+        return;
+    }
+    std::cout << "    [HARDFAULT] " << label << " Page Reads(system-wide)=+" << (after - before) << "\n";
+}
+
+// ==============================================================================
+// KINTSUGI: DIRECT THREADED-REGION TIMING
+// ==============================================================================
+// Two consecutive threading tests (default thread count, then clamped to 3)
+// both landed flat at ~9.2-9.3s, no measurable change either way. Rather
+// than guess at a third explanation from the aggregate step time, this
+// measures the ACTUAL wall-clock time spent inside the two threaded
+// functions directly -- MatVec and ComputeAttention -- separate from
+// everything else in the step (RMSNorm, RoPE, SwiGLU, the KV-cache push,
+// dequant, the layer-to-layer dependency chain itself).
+//
+// Thread-safety note: the timer wraps AROUND each #pragma omp parallel for
+// region, not inside its loop body. An omp for has an implicit barrier at
+// its end -- all worker threads have already finished and synchronized
+// before execution returns to the single calling thread that increments
+// the accumulator. That increment is never happening concurrently from
+// multiple threads, so no race condition here despite the functions being
+// threaded internally.
+double g_matvec_total_seconds = 0.0;
+double g_compute_attention_total_seconds = 0.0;
+double g_lmhead_sweep_total_seconds = 0.0;
+
+void PrintThreadedRegionDelta(const char* label, double matvec_before, double matvec_after,
+                                double attn_before, double attn_after,
+                                double lmhead_before, double lmhead_after, double step_total_seconds) {
+    double matvec_delta = matvec_after - matvec_before;
+    double attn_delta = attn_after - attn_before;
+    double lmhead_delta = lmhead_after - lmhead_before;
+    double threaded_total = matvec_delta + attn_delta + lmhead_delta;
+    double outside_threaded = step_total_seconds - threaded_total;
+    std::cout << "    [THREADTIME] " << label << " MatVec=" << matvec_delta
+              << "s ComputeAttention=" << attn_delta << "s LMHeadSweep=" << lmhead_delta
+              << "s ThreadedTotal=" << threaded_total
+              << "s OutsideThreaded=" << outside_threaded << "s (of " << step_total_seconds << "s step)\n";
 }
 
 // ==============================================================================
@@ -579,6 +723,15 @@ struct KintsugiAttention {
     static constexpr size_t HEAD_DIM = 128;
     static constexpr size_t Q_PER_KV = NUM_Q_HEADS / NUM_KV_HEADS; // 4
 
+    // Compile-time mirror of DECODE_TEST_CONTEXT (defined later, inside
+    // main() at boot) -- needed here because a thread-private stack array
+    // requires a size known at compile time, and this struct is defined
+    // hundreds of lines before that constant exists. MUST stay in sync
+    // with the real KV cache size; if that ever changes, this needs to
+    // change with it, same kind of cross-file constant duplication
+    // already flagged for the reservoir's MONOLITHIC_ARENA_SIZE mirror.
+    static constexpr size_t MAX_CONTEXT_FOR_THREADING = 128;
+
     // query_vec        : [4096] — NOT yet RoPE-rotated, no Wq/Wk/Wv/Wo exist yet.
     // kv_cache          : hidden_dimension MUST be NUM_KV_HEADS*HEAD_DIM (1024).
     // context_len       : valid rows currently in the cache.
@@ -597,9 +750,29 @@ struct KintsugiAttention {
 
         const float scale = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
 
+        // score_scratch (the parameter) is intentionally UNUSED below.
+        // It was designed for sequential reuse across heads -- every head
+        // wrote into and read from the SAME buffer, safe only because one
+        // head finished before the next started. Threading this loop
+        // across heads means multiple heads now run concurrently, and
+        // that shared-buffer pattern becomes a genuine data race: two
+        // threads writing/reading the same score_scratch[t] slots at the
+        // same time, silently corrupting scores in a way that wouldn't
+        // reproduce the same way twice. Fixed by giving each iteration
+        // its own thread-private array instead -- declared fresh inside
+        // the loop body, which OpenMP treats as private to each thread
+        // automatically, no explicit private() clause needed.
+        //
+        // The parameter itself is left in place rather than removed --
+        // it's threaded through ForwardOneLayer's own signature, both its
+        // call sites, and an OOM null-check in main(); this fix is scoped
+        // to ComputeAttention's internals only, not a five-place signature change.
+        auto attn_t0 = std::chrono::high_resolution_clock::now();
+        #pragma omp parallel for schedule(static)
         for (size_t qh = 0; qh < NUM_Q_HEADS; ++qh) {
             const size_t kvh = qh / Q_PER_KV; // GQA grouping
             const float* q_head = query_vec + (qh * HEAD_DIM);
+            float local_score[MAX_CONTEXT_FOR_THREADING];
 
             // --- 1. Scaled dot-product scores against every cached position ---
             float max_score = -std::numeric_limits<float>::infinity();
@@ -617,15 +790,15 @@ struct KintsugiAttention {
                 float dot = lanes[0]+lanes[1]+lanes[2]+lanes[3]+lanes[4]+lanes[5]+lanes[6]+lanes[7];
 
                 float score = dot * scale;
-                score_scratch[t] = score;
+                local_score[t] = score;
                 if (score > max_score) max_score = score;
             }
 
             // --- 2. Softmax, numerically stable ---
             float sum_exp = 0.0f;
             for (size_t t = 0; t < context_len; ++t) {
-                float e = std::exp(score_scratch[t] - max_score);
-                score_scratch[t] = e;
+                float e = std::exp(local_score[t] - max_score);
+                local_score[t] = e;
                 sum_exp += e;
             }
             float inv_sum = 1.0f / sum_exp;
@@ -645,7 +818,7 @@ struct KintsugiAttention {
                 for (size_t c = 0; c < ACC_CHUNK; ++c) acc[c] = _mm256_setzero_ps();
 
                 for (size_t t = 0; t < context_len; ++t) {
-                    __m256 v_weight = _mm256_set1_ps(score_scratch[t] * inv_sum);
+                    __m256 v_weight = _mm256_set1_ps(local_score[t] * inv_sum);
                     const float* v_row = kv_cache.value_matrix + (t * kv_cache.hidden_dimension) + (kvh * HEAD_DIM) + base;
 
                     for (size_t c = 0; c < ACC_CHUNK; ++c) {
@@ -659,6 +832,8 @@ struct KintsugiAttention {
                 }
             }
         }
+        auto attn_t1 = std::chrono::high_resolution_clock::now();
+        g_compute_attention_total_seconds += std::chrono::duration<double>(attn_t1 - attn_t0).count();
     }
 };
 
@@ -2057,30 +2232,86 @@ std::vector<TopKCandidate> RunLMHeadSweep(const uint8_t* lm_head_buffer,
                                            const float* normed_residual,
                                            size_t d_model, size_t vocab_size,
                                            float* lm_row_scratch, size_t top_k) {
+    auto lmhead_t0 = std::chrono::high_resolution_clock::now();
     std::vector<TopKCandidate> top(top_k, {0, -1e30f});
     if (!lm_head_buffer) return top;
 
     constexpr size_t BPR = 4096 / 256;
     constexpr size_t RB  = BPR * sizeof(GGML_Q6_K_Block);
 
-    for (size_t v = 0; v < vocab_size; ++v) {
-        const GGML_Q6_K_Block* row_blocks = reinterpret_cast<const GGML_Q6_K_Block*>(lm_head_buffer + v * RB);
-        dequantize_q6_k_row(row_blocks, lm_row_scratch, BPR);
+    // Real evidence this was worth doing, not a guess: the [THREADTIME]
+    // instrumentation showed MatVec+ComputeAttention only account for
+    // ~17.6% of a decode step; this 128,256-row sweep, never threaded
+    // until now, is the strongest candidate for the other ~82%.
+    //
+    // lm_row_scratch (the parameter) is intentionally UNUSED below --
+    // same reasoning as ComputeAttention's score_scratch: built for
+    // sequential reuse across rows, unsafe the moment multiple rows get
+    // dequantized concurrently. Each thread gets its own local scratch,
+    // sized from the real runtime d_model via std::vector rather than a
+    // hardcoded stack array -- this model's d_model happens to be 4096,
+    // but hardcoding that would silently break if this function were
+    // ever called against a different architecture. Allocated once per
+    // thread per call (a handful of times per decode step), not per row
+    // -- nothing like the vector-per-iteration cost already correctly
+    // ruled out for ComputeAttention's per-head scratch.
+    //
+    // The top-K list itself is the real correctness question here, not
+    // just the scratch buffer: this is a genuine reduction, not
+    // independent per-row writes like MatVec's out[r]. Naively
+    // parallelizing the existing insertion-sort-into-shared-top pattern
+    // would mean multiple threads reordering the same vector at the same
+    // time -- a real race, same class as score_scratch, different shape.
+    // Fixed with the standard pattern: each thread builds its own local
+    // top-K over its assigned rows; after the parallel region's implicit
+    // barrier, all per-thread lists get merged into one correct final
+    // list using the exact same insertion-sort logic, just over a much
+    // smaller pool (thread_count * top_k candidates, not vocab_size).
+    int max_threads = omp_get_max_threads();
+    std::vector<std::vector<TopKCandidate>> thread_local_tops(
+        max_threads, std::vector<TopKCandidate>(top_k, {0, -1e30f}));
 
-        __m256 acc = _mm256_setzero_ps();
-        for (size_t i = 0; i < d_model; i += 8)
-            acc = _mm256_fmadd_ps(_mm256_load_ps(&normed_residual[i]),
-                                  _mm256_load_ps(&lm_row_scratch[i]), acc);
-        alignas(32) float lanes[8];
-        _mm256_store_ps(lanes, acc);
-        float dot = lanes[0]+lanes[1]+lanes[2]+lanes[3]+lanes[4]+lanes[5]+lanes[6]+lanes[7];
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        std::vector<TopKCandidate>& local_top = thread_local_tops[tid];
+        std::vector<float> local_scratch(d_model);
 
-        if (dot > top.back().score) {
-            top.back() = {static_cast<uint32_t>(v), dot};
-            for (size_t t = top.size() - 1; t > 0 && top[t].score > top[t-1].score; --t)
-                std::swap(top[t], top[t-1]);
+        #pragma omp for schedule(static)
+        for (size_t v = 0; v < vocab_size; ++v) {
+            const GGML_Q6_K_Block* row_blocks = reinterpret_cast<const GGML_Q6_K_Block*>(lm_head_buffer + v * RB);
+            dequantize_q6_k_row(row_blocks, local_scratch.data(), BPR);
+
+            __m256 acc = _mm256_setzero_ps();
+            for (size_t i = 0; i < d_model; i += 8)
+                acc = _mm256_fmadd_ps(_mm256_load_ps(&normed_residual[i]),
+                                      _mm256_load_ps(&local_scratch[i]), acc);
+            alignas(32) float lanes[8];
+            _mm256_store_ps(lanes, acc);
+            float dot = lanes[0]+lanes[1]+lanes[2]+lanes[3]+lanes[4]+lanes[5]+lanes[6]+lanes[7];
+
+            if (dot > local_top.back().score) {
+                local_top.back() = {static_cast<uint32_t>(v), dot};
+                for (size_t t = local_top.size() - 1; t > 0 && local_top[t].score > local_top[t-1].score; --t)
+                    std::swap(local_top[t], local_top[t-1]);
+            }
         }
     }
+
+    // Merge: fold every per-thread top-K list into the single final one,
+    // same insertion-sort-on-insert logic as the per-row loop above.
+    for (const auto& local_top : thread_local_tops) {
+        for (const auto& candidate : local_top) {
+            if (candidate.score > top.back().score) {
+                top.back() = candidate;
+                for (size_t t = top.size() - 1; t > 0 && top[t].score > top[t-1].score; --t)
+                    std::swap(top[t], top[t-1]);
+            }
+        }
+    }
+
+    auto lmhead_t1 = std::chrono::high_resolution_clock::now();
+    g_lmhead_sweep_total_seconds += std::chrono::duration<double>(lmhead_t1 - lmhead_t0).count();
     return top;
 }
 
@@ -2434,6 +2665,8 @@ void MatVec(const float* __restrict__ mat,
              const float* __restrict__ vec,
              float* __restrict__ out,
              size_t in_dim, size_t out_dim) {
+    auto matvec_t0 = std::chrono::high_resolution_clock::now();
+    #pragma omp parallel for schedule(static)
     for (size_t r = 0; r < out_dim; ++r) {
         __m256 acc = _mm256_setzero_ps();
         const float* row = mat + r * in_dim;
@@ -2446,6 +2679,8 @@ void MatVec(const float* __restrict__ mat,
         out[r] = lanes[0]+lanes[1]+lanes[2]+lanes[3]+
                  lanes[4]+lanes[5]+lanes[6]+lanes[7];
     }
+    auto matvec_t1 = std::chrono::high_resolution_clock::now();
+    g_matvec_total_seconds += std::chrono::duration<double>(matvec_t1 - matvec_t0).count();
 }
 
 // Rotary Position Embedding, applied in-place to a packed [n_heads x head_dim] vector.
@@ -2540,6 +2775,8 @@ int main() {
     // which mangles every emoji and box-drawing character in the output.
     // This was the very first thing flagged in session 1, finally landing now.
     SetConsoleOutputCP(CP_UTF8);
+
+    InitPdhHardFaultQuery();
 
     // Tokenizer Phase I, part 1: prove the codepoint classifier and UTF-8
     // decoder are correct BEFORE anything downstream (the pretokenizer
@@ -2747,6 +2984,19 @@ int main() {
     } else {
         std::cerr << "[!] Warning: Process affinity lock failed.\n";
     }
+
+    // Paired deliberately with the affinity mask above, not set independently.
+    // OpenMP's default thread count comes from querying total system logical
+    // processors, with no awareness of the 3-core cage just applied -- if
+    // that default exceeds 3, every #pragma omp parallel for region spawns
+    // more threads than there are cores to run them on, causing exactly the
+    // oversubscription/context-switch thrashing that would erase whatever
+    // speedup the threading was meant to provide. Hardcoded rather than left
+    // to the OMP_NUM_THREADS environment variable, which depends on how the
+    // .exe gets launched and can silently be ignored.
+    omp_set_num_threads(3);
+    std::cout << "[⚡ SILICON] OpenMP thread pool clamped to 3 -- matching the affinity cage, "
+                 "not the system's full logical core count.\n";
 
     // Memory-map the GGUF once. Every layer load and every LM-head sweep from
     // here on reads through this mapping — first touch pays disk cost, every
@@ -3024,6 +3274,7 @@ int main() {
 
         std::cout << "[🧠 JARVIS] PREFILL: " << prompt_len << " instruct tokens\n";
         PrintMemoryUsage("before prefill (32 layers)");
+        LONGLONG hardfault_before_prefill = GetHardFaultRaw();
 
         auto total_start = std::chrono::high_resolution_clock::now();
         bool inference_ok = true;
@@ -3097,6 +3348,8 @@ int main() {
         std::cout << "[🧠 JARVIS] Predicted token_id=" << best_token
                   << " (score=" << best_score << ") in " << total_dur.count() << "s\n";
         PrintMemoryUsage("after prefill + first LM-head sweep");
+        LONGLONG hardfault_after_prefill = GetHardFaultRaw();
+        PrintHardFaultDelta("prefill (32 layers + LM-head sweep)", hardfault_before_prefill, hardfault_after_prefill);
 
         // --- CHECKPOINT 2: WATERMARK-GATED, CAPPED WORKING-SET TRIM ---
         // Upgraded from a full-evict version (-1,-1) that DID work — it took
@@ -3207,6 +3460,11 @@ int main() {
                 g_Embedding.Lookup(current_token, decode_residual);
 
                 auto step_start = std::chrono::high_resolution_clock::now();
+                LONGLONG hardfault_before_step = GetHardFaultRaw();
+                DWORD softfault_before_step = GetPageFaultCount();
+                double matvec_before_step = g_matvec_total_seconds;
+                double attn_before_step = g_compute_attention_total_seconds;
+                double lmhead_before_step = g_lmhead_sweep_total_seconds;
                 bool decode_ok = true;
 
                 for (size_t layer = 0; layer < real_num_layers && decode_ok; ++layer) {
@@ -3254,6 +3512,34 @@ int main() {
                           << "): token_id=" << step_best_token << " (score=" << step_best_score
                           << ") in " << step_dur.count() << "s\n";
                 PrintMemoryUsage("after this decode step");
+                LONGLONG hardfault_after_step = GetHardFaultRaw();
+                PrintHardFaultDelta("this decode step", hardfault_before_step, hardfault_after_step);
+                double matvec_after_step = g_matvec_total_seconds;
+                double attn_after_step = g_compute_attention_total_seconds;
+                double lmhead_after_step = g_lmhead_sweep_total_seconds;
+                PrintThreadedRegionDelta("this decode step", matvec_before_step, matvec_after_step,
+                                          attn_before_step, attn_after_step,
+                                          lmhead_before_step, lmhead_after_step, step_dur.count());
+
+                // Threshold-gated, not unconditional: the ~39 settled steps
+                // tonight ran near-zero fault deltas (0-200-ish); the two
+                // real anomaly events (steps 11-12 and 14-15 across separate
+                // runs) ran in the hundreds of thousands. 10,000 cleanly
+                // separates "normal churn" from "something real happened" —
+                // checking residency on every step would just print
+                // "resident" 39 times and bury the one reading that matters.
+                DWORD softfault_after_step = GetPageFaultCount();
+                if (softfault_before_step != static_cast<DWORD>(-1) && softfault_after_step != static_cast<DWORD>(-1)) {
+                    DWORD step_soft_delta = softfault_after_step - softfault_before_step;
+                    if (step_soft_delta > 10000) {
+                        std::cout << "    [ANOMALY] Fault delta " << step_soft_delta
+                                  << " exceeds threshold -- checking what actually got evicted:\n";
+                        constexpr size_t LM_BPR_DECODE = 4096 / 256;
+                        constexpr size_t LM_ROW_BYTES_DECODE = LM_BPR_DECODE * sizeof(GGML_Q6_K_Block);
+                        const size_t lm_head_check_bytes_decode = vocab_size * LM_ROW_BYTES_DECODE;
+                        PrintBufferResidency("lm_head_buffer post-anomaly", lm_head_buffer, lm_head_check_bytes_decode);
+                    }
+                }
 
                 if (step_best_token == EOT_TOKEN) {
                     std::cout << "[🧠 JARVIS] <|eot_id|> generated — model signaled it's done. "
