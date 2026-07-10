@@ -138,11 +138,14 @@ struct TensorArena {
 
         // --- 1.5. SAFETY NET, NOT PLAN A: try the shared large-page reservoir ---
         // If kintsugi_page_reservoir.exe is running (started at boot, before
-        // fragmentation sets in), it's already holding a Global\ named
+        // fragmentation sets in), it's already holding a Local\ named
         // mapping backed by genuinely large pages — guaranteed, since it
         // grabbed them fresh at startup rather than fighting fragmented
-        // physical RAM hours into a session. If it's there, this is
-        // strictly better than anything below and we return immediately.
+        // physical RAM hours into a session. Local\ is session-scoped: this
+        // only works when both processes run in the same interactive
+        // session, not under a SYSTEM/Task-Scheduler deployment (open item,
+        // see CLAUDE.md). If it's there, this is strictly better than
+        // anything below and we return immediately.
         // If it's NOT there (reservoir never started, or this machine
         // doesn't run it), this falls straight through to the existing,
         // already-proven self-contained attempt below, completely
@@ -156,20 +159,55 @@ struct TensorArena {
         HANDLE hReservoir = OpenFileMappingW(FILE_MAP_ALL_ACCESS | FILE_MAP_LARGE_PAGES,
                                               FALSE, L"Local\\KintsugiLargePageReservoir");
         if (hReservoir) {
-            void* reservoir_view = MapViewOfFile(hReservoir, FILE_MAP_ALL_ACCESS | FILE_MAP_LARGE_PAGES,
-                                                  0, 0, size_in_bytes);
+            // Don't assume the reservoir secured the full size_in_bytes —
+            // it probes for the largest contiguous size it can actually get
+            // (kintsugi_page_reservoir.cpp's own CANDIDATE_SIZES_MB loop),
+            // and that number varies by boot/system conditions. Requesting
+            // a view larger than what's really backing the mapping is
+            // exactly the kind of assumption that either fails outright or,
+            // worse, "succeeds" in some edge case while total_capacity
+            // silently doesn't match reality — the bump allocator's own
+            // bounds check (AllocateAligned) only protects against overrun
+            // if total_capacity is TRUE, not assumed. Mirroring the
+            // reservoir's own probe here closes that gap: whatever size
+            // actually maps IS by construction what the reservoir holds,
+            // no separate communication channel needed, no assumption left
+            // standing unverified.
+            constexpr size_t PROBE_SIZES_MB[] = { 1536, 1024, 768, 512, 256, 128, 64, 32, 2 };
+            void* reservoir_view = nullptr;
+            size_t reservoir_actual_bytes = 0;
+
+            for (size_t candidate_mb : PROBE_SIZES_MB) {
+                size_t candidate_bytes = candidate_mb * 1024ULL * 1024ULL;
+                if (candidate_bytes > size_in_bytes) continue; // never map more than the engine actually asked for
+                reservoir_view = MapViewOfFile(hReservoir, FILE_MAP_ALL_ACCESS | FILE_MAP_LARGE_PAGES,
+                                                0, 0, candidate_bytes);
+                if (reservoir_view) {
+                    reservoir_actual_bytes = candidate_bytes;
+                    break;
+                }
+            }
+
             if (reservoir_view) {
                 std::cout << "[🏦 RESERVOIR] Found kintsugi_page_reservoir.exe's standing large-page "
                              "reservation — using it directly, skipping the fragmentation-prone attempt below.\n";
+                std::cout << "[🏦 RESERVOIR] Secured " << (reservoir_actual_bytes / (1024.0 * 1024.0))
+                          << "MB (requested up to " << (size_in_bytes / (1024.0 * 1024.0))
+                          << "MB) — total_capacity set to what's ACTUALLY mapped, not assumed.\n";
+                if (reservoir_actual_bytes < size_in_bytes) {
+                    std::cout << "[🏦 RESERVOIR] NOTE: this is smaller than the full arena request. "
+                                 "Later allocations that don't fit will fail safely with a clear OOM "
+                                 "message (AllocateAligned's own bounds check), not silently overrun.\n";
+                }
                 raw_base_ptr = reservoir_view;
-                total_capacity = size_in_bytes;
+                total_capacity = reservoir_actual_bytes; // the real, verified size -- not size_in_bytes
                 current_offset = 0;
                 reservoir_handle = hReservoir; // kept alive for Teardown(); do NOT VirtualFree this memory
                 return true;
             }
-            // Mapping existed but view failed (reservoir sized differently,
-            // or some other mismatch) -- close the handle and fall through
-            // to the existing self-contained path rather than half-use it.
+            // No size at all mapped successfully -- close the handle and
+            // fall through to the existing self-contained path rather than
+            // half-use it.
             CloseHandle(hReservoir);
         }
 
