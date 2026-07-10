@@ -36,7 +36,7 @@ if sys.stdout.encoding.lower() != "utf-8":
     sys.stderr.reconfigure(encoding="utf-8")
 
 BUS_PATH = r"K:\kintsugi\core\shared_bus.dat"
-TEST_PROMPT = "a farmer has 17 sheep, all but 9 die, how many are left?"
+TEST_PROMPT = "what is 6 times 7?"
 POLL_INTERVAL_SEC = 0.5
 # The engine no longer stops after one prefill token — it now runs up to
 # NUM_DECODE_STEPS=40 additional full 32-layer decode passes internally
