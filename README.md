@@ -1,2 +1,0 @@
-# kintsugi
-personal-jarvis
