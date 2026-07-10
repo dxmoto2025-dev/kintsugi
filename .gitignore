@@ -16,3 +16,6 @@ __pycache__/
 # Runtime state and diagnostics (regenerated on every run, not source)
 core/shared_bus.dat
 mem_trace_wake_*.csv
+engine_run_*.log
+wake_run_*.log
+reservoir_run_*.log

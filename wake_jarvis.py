@@ -25,6 +25,16 @@ import subprocess
 from ctypes import wintypes
 from shared_bus import SiliconGatePortal, BUS_STRUCT_SIZE, KINT_MAGIC, BUS_VERSION
 
+# Windows defaults stdout to the system codepage (cp1252) whenever it isn't
+# a real console -- e.g. redirected to a file or piped. The emoji in this
+# script's own print statements (⚡ etc.) then raise UnicodeEncodeError
+# and kill the script *before* it flips enable_programming_pin, silently
+# leaving the engine waiting forever. Force UTF-8 unconditionally so
+# redirected/piped runs behave the same as an interactive terminal.
+if sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 BUS_PATH = r"K:\kintsugi\core\shared_bus.dat"
 TEST_PROMPT = "a farmer has 17 sheep, all but 9 die, how many are left?"
 POLL_INTERVAL_SEC = 0.5
