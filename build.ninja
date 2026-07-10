@@ -2,7 +2,7 @@ cc = C:\Users\Admin\Downloads\Kintsugi_Edge\build\quantum-silicon-os\build\Produ
 cflags = -O3 -fno-rtti -fno-exceptions -mavx2 -mfma -fopenmp -std=c++20 -static
 
 rule compile
-  command = $cc $cflags $in -o $out -lkernel32 -luser32 -ladvapi32
+  command = $cc $cflags $in -o $out -lkernel32 -luser32 -ladvapi32 -lpdh
   description = FORGING INFERENCE LIVE EXECUTION ENGINE: $out
 
 build kintsugi_inference.exe: compile kintsugi_inference.cpp

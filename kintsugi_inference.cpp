@@ -3384,41 +3384,80 @@ int main() {
         // after the first post-LM-head-buffer run. 2304MB gives ~317MB of
         // real margin above the current baseline, the same kind of margin
         // 1792MB gave above the old one.
-        constexpr double CHECKPOINT2_WATERMARK_MB = 3072.0;                     // trigger threshold — prefill alone reliably exceeds this
-        constexpr SIZE_T CHECKPOINT2_MIN_BYTES    = 2304ULL * 1024ULL * 1024ULL; // 2.25GB floor — covers the real ~1987MB arena+LM-head baseline
-        constexpr SIZE_T CHECKPOINT2_MAX_BYTES    = 3072ULL * 1024ULL * 1024ULL; // 3GB ceiling — ~2.2GB of real relief off the ~5.4GB peak
+        constexpr double CHECKPOINT2_WATERMARK_MB   = 3072.0;                     // trigger threshold — prefill alone reliably exceeds this
+        constexpr SIZE_T CHECKPOINT2_MIN_BYTES      = 2304ULL * 1024ULL * 1024ULL; // 2.25GB floor — covers the real ~1987MB arena+LM-head baseline
+        constexpr SIZE_T CHECKPOINT2_MAX_BYTES      = 3072ULL * 1024ULL * 1024ULL; // 3GB ceiling — ~2.2GB of real relief off the ~5.4GB peak
+        constexpr double CHECKPOINT2_MIN_RECLAIM_MB = 256.0;                      // below this, the OS round-trip isn't worth making
+
+        // MIN_BYTES/MAX_BYTES above were calibrated as if the entire working
+        // set were pageable. When the arena is backed by the reservoir
+        // (g_Arena.reservoir_handle != nullptr), a chunk of it is that
+        // process's locked/large-page memory — Windows can never trim that
+        // portion out of THIS process's working set no matter what min/max
+        // gets requested here. Using g_Arena.total_capacity (the reservoir's
+        // real secured size) rather than an assumed 1536MB, same "verified,
+        // not assumed" rule the reservoir-connect code above already follows
+        // — the probe can land on a smaller candidate on a constrained boot.
+        const SIZE_T reservoir_locked_bytes = g_Arena.reservoir_handle ? g_Arena.total_capacity : 0;
+        const double reservoir_locked_mb    = static_cast<double>(reservoir_locked_bytes) / (1024.0 * 1024.0);
 
         double working_set_before_trim = GetProcessWorkingSetMB();
         if (working_set_before_trim > CHECKPOINT2_WATERMARK_MB) {
-            std::cout << "[🧊 CHECKPOINT 2] Working set " << working_set_before_trim
-                      << "MB exceeds " << CHECKPOINT2_WATERMARK_MB
-                      << "MB watermark — trimming (capped, not full evict).\n";
+            const double pageable_before_trim = working_set_before_trim - reservoir_locked_mb;
+            const double pageable_target_mb   = static_cast<double>(CHECKPOINT2_MAX_BYTES) / (1024.0 * 1024.0);
+            const double reclaimable_mb       = pageable_before_trim - pageable_target_mb;
 
-            BOOL trim_ok = SetProcessWorkingSetSize(GetCurrentProcess(), CHECKPOINT2_MIN_BYTES, CHECKPOINT2_MAX_BYTES);
-            if (!trim_ok) {
-                // Capture immediately — same evaluation-order fix already
-                // established elsewhere in this file for this exact bug class.
-                DWORD trim_err = GetLastError();
-                std::cerr << "[!] WARNING: Checkpoint 2 capped trim failed. Error Code: "
-                          << trim_err << " — continuing anyway, this is an optimization, not a requirement.\n";
-            } else {
-                std::cout << "[🧊 CHECKPOINT 2] Capped trim applied — targeting ~"
-                          << (static_cast<double>(CHECKPOINT2_MAX_BYTES) / (1024.0 * 1024.0))
-                          << "MB ceiling, OS LRU picks what stays resident.\n";
+            if (reservoir_locked_bytes > 0) {
+                std::cout << "[🧊 CHECKPOINT 2] " << reservoir_locked_mb << "MB of working set is the "
+                          << "reservoir's locked reservation (immutable) — " << pageable_before_trim
+                          << "MB is the real pageable portion.\n";
             }
-            PrintMemoryUsage("after checkpoint 2 capped trim");
 
-            // Direct answer to "did the LM-head buffer actually survive the
-            // trim" — non-invasive, doesn't touch/fault the pages, so this
-            // check itself can't warm them and contaminate what it's
-            // measuring. Samples 5 points across the buffer since partial
-            // eviction (some pages gone, others not) wouldn't show up from
-            // checking just the first/last byte.
-            {
-                constexpr size_t LM_BPR = 4096 / 256;
-                constexpr size_t LM_ROW_BYTES = LM_BPR * sizeof(GGML_Q6_K_Block);
-                const size_t lm_head_check_bytes = vocab_size * LM_ROW_BYTES;
-                PrintBufferResidency("lm_head_buffer post-trim", lm_head_buffer, lm_head_check_bytes);
+            if (reclaimable_mb < CHECKPOINT2_MIN_RECLAIM_MB) {
+                std::cout << "[🧊 CHECKPOINT 2] Only " << reclaimable_mb << "MB reclaimable above the "
+                          << pageable_target_mb << "MB pageable target — below the "
+                          << CHECKPOINT2_MIN_RECLAIM_MB << "MB worth-it floor. Skipping the trim call "
+                          << "entirely rather than asking the OS for a target that's already unreachable "
+                          << "(that doomed request against an already-tight budget is the 1450 cascade).\n";
+            } else {
+                std::cout << "[🧊 CHECKPOINT 2] Working set " << working_set_before_trim
+                          << "MB exceeds " << CHECKPOINT2_WATERMARK_MB
+                          << "MB watermark — trimming (capped, not full evict).\n";
+
+                // Fold the locked reservoir bytes into BOTH floor and ceiling
+                // so the absolute numbers handed to the OS describe what's
+                // actually achievable (pageable target + immutable floor),
+                // not a total that silently assumed zero locked memory.
+                const SIZE_T effective_min = CHECKPOINT2_MIN_BYTES + reservoir_locked_bytes;
+                const SIZE_T effective_max = CHECKPOINT2_MAX_BYTES + reservoir_locked_bytes;
+
+                BOOL trim_ok = SetProcessWorkingSetSize(GetCurrentProcess(), effective_min, effective_max);
+                if (!trim_ok) {
+                    // Capture immediately — same evaluation-order fix already
+                    // established elsewhere in this file for this exact bug class.
+                    DWORD trim_err = GetLastError();
+                    std::cerr << "[!] WARNING: Checkpoint 2 capped trim failed. Error Code: "
+                              << trim_err << " — continuing anyway, this is an optimization, not a requirement.\n";
+                } else {
+                    std::cout << "[🧊 CHECKPOINT 2] Capped trim applied — targeting ~"
+                              << (static_cast<double>(effective_max) / (1024.0 * 1024.0))
+                              << "MB ceiling (" << pageable_target_mb << "MB pageable + "
+                              << reservoir_locked_mb << "MB locked reservoir), OS LRU picks what stays resident.\n";
+                }
+                PrintMemoryUsage("after checkpoint 2 capped trim");
+
+                // Direct answer to "did the LM-head buffer actually survive the
+                // trim" — non-invasive, doesn't touch/fault the pages, so this
+                // check itself can't warm them and contaminate what it's
+                // measuring. Samples 5 points across the buffer since partial
+                // eviction (some pages gone, others not) wouldn't show up from
+                // checking just the first/last byte.
+                {
+                    constexpr size_t LM_BPR = 4096 / 256;
+                    constexpr size_t LM_ROW_BYTES = LM_BPR * sizeof(GGML_Q6_K_Block);
+                    const size_t lm_head_check_bytes = vocab_size * LM_ROW_BYTES;
+                    PrintBufferResidency("lm_head_buffer post-trim", lm_head_buffer, lm_head_check_bytes);
+                }
             }
         } else {
             std::cout << "[🧊 CHECKPOINT 2] Working set " << working_set_before_trim
