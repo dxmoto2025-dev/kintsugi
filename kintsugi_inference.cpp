@@ -227,19 +227,38 @@ void PrintHardFaultDelta(const char* label, LONGLONG before, LONGLONG after) {
 double g_matvec_total_seconds = 0.0;
 double g_compute_attention_total_seconds = 0.0;
 double g_lmhead_sweep_total_seconds = 0.0;
+double g_fastload_dequant_total_seconds = 0.0;
 
-void PrintThreadedRegionDelta(const char* label, double matvec_before, double matvec_after,
-                                double attn_before, double attn_after,
-                                double lmhead_before, double lmhead_after, double step_total_seconds) {
-    double matvec_delta = matvec_after - matvec_before;
-    double attn_delta = attn_after - attn_before;
-    double lmhead_delta = lmhead_after - lmhead_before;
+struct ThreadedRegionSnapshot {
+    double matvec, compute_attention, lmhead_sweep, fastload_dequant;
+};
+
+ThreadedRegionSnapshot TakeThreadedRegionSnapshot() {
+    return { g_matvec_total_seconds, g_compute_attention_total_seconds,
+             g_lmhead_sweep_total_seconds, g_fastload_dequant_total_seconds };
+}
+
+// Two totals reported, deliberately kept separate: ThreadedTotal is only
+// the pieces actually running under #pragma omp (MatVec, ComputeAttention,
+// LMHeadSweep) -- AccountedTotal adds FastLoadDequant on top, which is
+// measured but NOT yet threaded. Keeping them apart means a newly-measured
+// candidate is visible on its own before any decision gets made about
+// whether it's worth threading, rather than silently folding it into a
+// number that implies it's already been addressed.
+void PrintThreadedRegionDelta(const char* label, const ThreadedRegionSnapshot& before,
+                                const ThreadedRegionSnapshot& after, double step_total_seconds) {
+    double matvec_delta = after.matvec - before.matvec;
+    double attn_delta = after.compute_attention - before.compute_attention;
+    double lmhead_delta = after.lmhead_sweep - before.lmhead_sweep;
+    double dequant_delta = after.fastload_dequant - before.fastload_dequant;
     double threaded_total = matvec_delta + attn_delta + lmhead_delta;
-    double outside_threaded = step_total_seconds - threaded_total;
+    double accounted_total = threaded_total + dequant_delta;
+    double outside_accounted = step_total_seconds - accounted_total;
     std::cout << "    [THREADTIME] " << label << " MatVec=" << matvec_delta
               << "s ComputeAttention=" << attn_delta << "s LMHeadSweep=" << lmhead_delta
-              << "s ThreadedTotal=" << threaded_total
-              << "s OutsideThreaded=" << outside_threaded << "s (of " << step_total_seconds << "s step)\n";
+              << "s FastLoadDequant=" << dequant_delta << "s ThreadedTotal=" << threaded_total
+              << "s AccountedTotal=" << accounted_total
+              << "s OutsideAccounted=" << outside_accounted << "s (of " << step_total_seconds << "s step)\n";
 }
 
 // ==============================================================================
@@ -2576,11 +2595,13 @@ bool FastLoadLayer(size_t layer_idx, TensorArena& arena, KintsugiLayerWeights& o
         } else if (type == 12) { // Q4_K
             const GGML_Q4_K_Block* blocks = reinterpret_cast<const GGML_Q4_K_Block*>(src);
             size_t nblocks = n_elems / 256;
+            #pragma omp parallel for schedule(static)
             for (size_t b = 0; b < nblocks; ++b)
                 dequantize_q4_k_block(blocks[b], dst + b * 256);
         } else if (type == 14) { // Q6_K
             const GGML_Q6_K_Block* blocks = reinterpret_cast<const GGML_Q6_K_Block*>(src);
             size_t nblocks = n_elems / 256;
+            #pragma omp parallel for schedule(static)
             for (size_t b = 0; b < nblocks; ++b)
                 dequantize_q6_k_block(blocks[b], dst + b * 256);
         } else {
@@ -2591,6 +2612,7 @@ bool FastLoadLayer(size_t layer_idx, TensorArena& arena, KintsugiLayerWeights& o
     };
 
     bool ok = true;
+    auto dequant_t0 = std::chrono::high_resolution_clock::now();
     ok &= fast_load(c.wq,        c.wq_type,        out.wq,        D  * D );
     ok &= fast_load(c.wk,        c.wk_type,        out.wk,        KV * D );
     ok &= fast_load(c.wv,        c.wv_type,        out.wv,        KV * D );
@@ -2600,6 +2622,8 @@ bool FastLoadLayer(size_t layer_idx, TensorArena& arena, KintsugiLayerWeights& o
     ok &= fast_load(c.ffn_up,    c.ffn_up_type,    out.ffn_up,    FF * D );
     ok &= fast_load(c.ffn_down,  c.ffn_down_type,  out.ffn_down,  D  * FF);
     ok &= fast_load(c.ffn_norm,  0,                out.ffn_norm,  D      );
+    auto dequant_t1 = std::chrono::high_resolution_clock::now();
+    g_fastload_dequant_total_seconds += std::chrono::duration<double>(dequant_t1 - dequant_t0).count();
     return ok;
 }
 
@@ -3384,80 +3408,41 @@ int main() {
         // after the first post-LM-head-buffer run. 2304MB gives ~317MB of
         // real margin above the current baseline, the same kind of margin
         // 1792MB gave above the old one.
-        constexpr double CHECKPOINT2_WATERMARK_MB   = 3072.0;                     // trigger threshold — prefill alone reliably exceeds this
-        constexpr SIZE_T CHECKPOINT2_MIN_BYTES      = 2304ULL * 1024ULL * 1024ULL; // 2.25GB floor — covers the real ~1987MB arena+LM-head baseline
-        constexpr SIZE_T CHECKPOINT2_MAX_BYTES      = 3072ULL * 1024ULL * 1024ULL; // 3GB ceiling — ~2.2GB of real relief off the ~5.4GB peak
-        constexpr double CHECKPOINT2_MIN_RECLAIM_MB = 256.0;                      // below this, the OS round-trip isn't worth making
-
-        // MIN_BYTES/MAX_BYTES above were calibrated as if the entire working
-        // set were pageable. When the arena is backed by the reservoir
-        // (g_Arena.reservoir_handle != nullptr), a chunk of it is that
-        // process's locked/large-page memory — Windows can never trim that
-        // portion out of THIS process's working set no matter what min/max
-        // gets requested here. Using g_Arena.total_capacity (the reservoir's
-        // real secured size) rather than an assumed 1536MB, same "verified,
-        // not assumed" rule the reservoir-connect code above already follows
-        // — the probe can land on a smaller candidate on a constrained boot.
-        const SIZE_T reservoir_locked_bytes = g_Arena.reservoir_handle ? g_Arena.total_capacity : 0;
-        const double reservoir_locked_mb    = static_cast<double>(reservoir_locked_bytes) / (1024.0 * 1024.0);
+        constexpr double CHECKPOINT2_WATERMARK_MB = 3072.0;                     // trigger threshold — prefill alone reliably exceeds this
+        constexpr SIZE_T CHECKPOINT2_MIN_BYTES    = 2304ULL * 1024ULL * 1024ULL; // 2.25GB floor — covers the real ~1987MB arena+LM-head baseline
+        constexpr SIZE_T CHECKPOINT2_MAX_BYTES    = 3072ULL * 1024ULL * 1024ULL; // 3GB ceiling — ~2.2GB of real relief off the ~5.4GB peak
 
         double working_set_before_trim = GetProcessWorkingSetMB();
         if (working_set_before_trim > CHECKPOINT2_WATERMARK_MB) {
-            const double pageable_before_trim = working_set_before_trim - reservoir_locked_mb;
-            const double pageable_target_mb   = static_cast<double>(CHECKPOINT2_MAX_BYTES) / (1024.0 * 1024.0);
-            const double reclaimable_mb       = pageable_before_trim - pageable_target_mb;
+            std::cout << "[🧊 CHECKPOINT 2] Working set " << working_set_before_trim
+                      << "MB exceeds " << CHECKPOINT2_WATERMARK_MB
+                      << "MB watermark — trimming (capped, not full evict).\n";
 
-            if (reservoir_locked_bytes > 0) {
-                std::cout << "[🧊 CHECKPOINT 2] " << reservoir_locked_mb << "MB of working set is the "
-                          << "reservoir's locked reservation (immutable) — " << pageable_before_trim
-                          << "MB is the real pageable portion.\n";
-            }
-
-            if (reclaimable_mb < CHECKPOINT2_MIN_RECLAIM_MB) {
-                std::cout << "[🧊 CHECKPOINT 2] Only " << reclaimable_mb << "MB reclaimable above the "
-                          << pageable_target_mb << "MB pageable target — below the "
-                          << CHECKPOINT2_MIN_RECLAIM_MB << "MB worth-it floor. Skipping the trim call "
-                          << "entirely rather than asking the OS for a target that's already unreachable "
-                          << "(that doomed request against an already-tight budget is the 1450 cascade).\n";
+            BOOL trim_ok = SetProcessWorkingSetSize(GetCurrentProcess(), CHECKPOINT2_MIN_BYTES, CHECKPOINT2_MAX_BYTES);
+            if (!trim_ok) {
+                // Capture immediately — same evaluation-order fix already
+                // established elsewhere in this file for this exact bug class.
+                DWORD trim_err = GetLastError();
+                std::cerr << "[!] WARNING: Checkpoint 2 capped trim failed. Error Code: "
+                          << trim_err << " — continuing anyway, this is an optimization, not a requirement.\n";
             } else {
-                std::cout << "[🧊 CHECKPOINT 2] Working set " << working_set_before_trim
-                          << "MB exceeds " << CHECKPOINT2_WATERMARK_MB
-                          << "MB watermark — trimming (capped, not full evict).\n";
+                std::cout << "[🧊 CHECKPOINT 2] Capped trim applied — targeting ~"
+                          << (static_cast<double>(CHECKPOINT2_MAX_BYTES) / (1024.0 * 1024.0))
+                          << "MB ceiling, OS LRU picks what stays resident.\n";
+            }
+            PrintMemoryUsage("after checkpoint 2 capped trim");
 
-                // Fold the locked reservoir bytes into BOTH floor and ceiling
-                // so the absolute numbers handed to the OS describe what's
-                // actually achievable (pageable target + immutable floor),
-                // not a total that silently assumed zero locked memory.
-                const SIZE_T effective_min = CHECKPOINT2_MIN_BYTES + reservoir_locked_bytes;
-                const SIZE_T effective_max = CHECKPOINT2_MAX_BYTES + reservoir_locked_bytes;
-
-                BOOL trim_ok = SetProcessWorkingSetSize(GetCurrentProcess(), effective_min, effective_max);
-                if (!trim_ok) {
-                    // Capture immediately — same evaluation-order fix already
-                    // established elsewhere in this file for this exact bug class.
-                    DWORD trim_err = GetLastError();
-                    std::cerr << "[!] WARNING: Checkpoint 2 capped trim failed. Error Code: "
-                              << trim_err << " — continuing anyway, this is an optimization, not a requirement.\n";
-                } else {
-                    std::cout << "[🧊 CHECKPOINT 2] Capped trim applied — targeting ~"
-                              << (static_cast<double>(effective_max) / (1024.0 * 1024.0))
-                              << "MB ceiling (" << pageable_target_mb << "MB pageable + "
-                              << reservoir_locked_mb << "MB locked reservoir), OS LRU picks what stays resident.\n";
-                }
-                PrintMemoryUsage("after checkpoint 2 capped trim");
-
-                // Direct answer to "did the LM-head buffer actually survive the
-                // trim" — non-invasive, doesn't touch/fault the pages, so this
-                // check itself can't warm them and contaminate what it's
-                // measuring. Samples 5 points across the buffer since partial
-                // eviction (some pages gone, others not) wouldn't show up from
-                // checking just the first/last byte.
-                {
-                    constexpr size_t LM_BPR = 4096 / 256;
-                    constexpr size_t LM_ROW_BYTES = LM_BPR * sizeof(GGML_Q6_K_Block);
-                    const size_t lm_head_check_bytes = vocab_size * LM_ROW_BYTES;
-                    PrintBufferResidency("lm_head_buffer post-trim", lm_head_buffer, lm_head_check_bytes);
-                }
+            // Direct answer to "did the LM-head buffer actually survive the
+            // trim" — non-invasive, doesn't touch/fault the pages, so this
+            // check itself can't warm them and contaminate what it's
+            // measuring. Samples 5 points across the buffer since partial
+            // eviction (some pages gone, others not) wouldn't show up from
+            // checking just the first/last byte.
+            {
+                constexpr size_t LM_BPR = 4096 / 256;
+                constexpr size_t LM_ROW_BYTES = LM_BPR * sizeof(GGML_Q6_K_Block);
+                const size_t lm_head_check_bytes = vocab_size * LM_ROW_BYTES;
+                PrintBufferResidency("lm_head_buffer post-trim", lm_head_buffer, lm_head_check_bytes);
             }
         } else {
             std::cout << "[🧊 CHECKPOINT 2] Working set " << working_set_before_trim
@@ -3501,9 +3486,7 @@ int main() {
                 auto step_start = std::chrono::high_resolution_clock::now();
                 LONGLONG hardfault_before_step = GetHardFaultRaw();
                 DWORD softfault_before_step = GetPageFaultCount();
-                double matvec_before_step = g_matvec_total_seconds;
-                double attn_before_step = g_compute_attention_total_seconds;
-                double lmhead_before_step = g_lmhead_sweep_total_seconds;
+                ThreadedRegionSnapshot threaded_before_step = TakeThreadedRegionSnapshot();
                 bool decode_ok = true;
 
                 for (size_t layer = 0; layer < real_num_layers && decode_ok; ++layer) {
@@ -3553,12 +3536,8 @@ int main() {
                 PrintMemoryUsage("after this decode step");
                 LONGLONG hardfault_after_step = GetHardFaultRaw();
                 PrintHardFaultDelta("this decode step", hardfault_before_step, hardfault_after_step);
-                double matvec_after_step = g_matvec_total_seconds;
-                double attn_after_step = g_compute_attention_total_seconds;
-                double lmhead_after_step = g_lmhead_sweep_total_seconds;
-                PrintThreadedRegionDelta("this decode step", matvec_before_step, matvec_after_step,
-                                          attn_before_step, attn_after_step,
-                                          lmhead_before_step, lmhead_after_step, step_dur.count());
+                ThreadedRegionSnapshot threaded_after_step = TakeThreadedRegionSnapshot();
+                PrintThreadedRegionDelta("this decode step", threaded_before_step, threaded_after_step, step_dur.count());
 
                 // Threshold-gated, not unconditional: the ~39 settled steps
                 // tonight ran near-zero fault deltas (0-200-ish); the two
